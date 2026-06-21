@@ -44,9 +44,9 @@ class BooguImagePipeline:
 
         dit = BooguImageTransformer2DModel.from_config(tcfg)
         qpath = os.path.join(tdir, "quant_config.json")
-        int4_path = os.path.join(tdir, "transformer_int4.safetensors")
-        if os.path.exists(qpath) and os.path.exists(int4_path):
-            qc = json.load(open(qpath))
+        qc = json.load(open(qpath)) if os.path.exists(qpath) else None
+        wfile = os.path.join(tdir, qc.get("weights_file", "transformer_int4.safetensors")) if qc else ""
+        if qc and os.path.exists(wfile):
             g, b = qc["group_size"], qc["bits"]
 
             def _pred(path, m):
@@ -54,7 +54,7 @@ class BooguImagePipeline:
                         and (("attn" in path) or ("feed_forward" in path))
                         and m.weight.shape[1] % g == 0)
             nn.quantize(dit, group_size=g, bits=b, class_predicate=_pred)
-            load_named_into_mlx(dit, {k: v for k, v in mx.load(int4_path).items()})
+            load_named_into_mlx(dit, {k: v for k, v in mx.load(wfile).items()})
         else:
             load_named_into_mlx(dit, read_safetensors_dir(tdir, dtype=dit_dtype))
         vae = AutoencoderKL.from_config(vcfg)
