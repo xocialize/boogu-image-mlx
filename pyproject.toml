@@ -1,0 +1,24 @@
+[project]
+name = "boogu-image-mlx"
+version = "0.0.1"
+description = "Pure MLX port of Boogu-Image-0.1 (OmniGen2-lineage T2I/edit) for Apple Silicon"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "mlx>=0.30",
+    "mlx-arsenal",
+    "numpy",
+    "safetensors",
+    "huggingface_hub",
+]
+
+[project.optional-dependencies]
+# Parity-only: end users don't need torch/diffusers to run inference.
+parity = [
+    "torch",
+    "diffusers>=0.35",
+    "transformers>=4.57",
+]
+
+[tool.setuptools.packages.find]
+include = ["boogu_image_mlx*"]
