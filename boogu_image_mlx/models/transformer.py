@@ -379,45 +379,70 @@ class BooguImageTransformer2DModel(nn.Module):
         x = x.transpose(0, 5, 1, 3, 2, 4)             # B c h p1 w p2
         return x.reshape(B, C, ht * p, wt * p)
 
-    def _position_ids(self, L_cap: int, ht: int, wt: int) -> np.ndarray:
-        cap = np.tile(np.arange(L_cap, dtype=np.int64)[:, None], (1, 3))     # [L_cap,3]
-        rows = np.repeat(np.arange(ht), wt)
-        cols = np.tile(np.arange(wt), ht)
-        img = np.stack([np.full(ht * wt, L_cap, dtype=np.int64), rows, cols], axis=1)
-        return np.concatenate([cap, img], axis=0)                            # [L_cap+L_img, 3]
+    def _position_ids(self, L_cap: int, ht: int, wt: int, ref=None) -> np.ndarray:
+        """[cap ; (ref) ; noise] 3-axis positions. ref = (rht, rwt) or None."""
+        parts = [np.tile(np.arange(L_cap, dtype=np.int64)[:, None], (1, 3))]
+        shift = L_cap
+        if ref is not None:
+            rht, rwt = ref
+            parts.append(np.stack([np.full(rht * rwt, shift, dtype=np.int64),
+                                   np.repeat(np.arange(rht), rwt), np.tile(np.arange(rwt), rht)], axis=1))
+            shift += max(rht, rwt)
+        parts.append(np.stack([np.full(ht * wt, shift, dtype=np.int64),
+                               np.repeat(np.arange(ht), wt), np.tile(np.arange(wt), ht)], axis=1))
+        return np.concatenate(parts, axis=0)
 
     def __call__(self, latent: mx.array, timestep: mx.array,
-                 instruction_hidden_states: mx.array) -> mx.array:
-        """latent [1,16,H,W]; timestep [1]; instruction [1,L_cap,4096] -> [1,16,H,W]."""
+                 instruction_hidden_states: mx.array, ref_latent: mx.array = None) -> mx.array:
+        """latent [1,16,H,W]; timestep [1]; instruction [1,L_cap,4096];
+        ref_latent [1,16,Hr,Wr] optional (Edit) -> denoised latent [1,16,H,W]."""
         B, C, H, W = latent.shape
         p = self.patch_size
         ht, wt = H // p, W // p
         L_cap = instruction_hidden_states.shape[1]
+        L_noise = ht * wt
 
         temb, caption = self.time_caption_embed(timestep, instruction_hidden_states)
-        x = self.x_embedder(self._patchify(latent))            # [1, L_img, hidden]
+        x = self.x_embedder(self._patchify(latent))            # noise tokens [1, L_noise, hid]
 
-        pos = self._position_ids(L_cap, ht, wt)
+        ref = None
+        if ref_latent is not None:
+            rht, rwt = ref_latent.shape[2] // p, ref_latent.shape[3] // p
+            ref = (rht, rwt)
+
+        pos = self._position_ids(L_cap, ht, wt, ref)
         cos_np, sin_np = rope_cos_sin(pos, self.axes_dim_rope, self.theta)
-        full_cos = mx.array(cos_np)[None, :, None, :]          # [1, L, 1, 60]
+        full_cos = mx.array(cos_np)[None, :, None, :]
         full_sin = mx.array(sin_np)[None, :, None, :]
         cap_cos, cap_sin = full_cos[:, :L_cap], full_sin[:, :L_cap]
-        img_cos, img_sin = full_cos[:, L_cap:], full_sin[:, L_cap:]
+        img_cos, img_sin = full_cos[:, L_cap:], full_sin[:, L_cap:]   # [ref ; noise] (or just noise)
 
         for layer in self.context_refiner:
             caption = layer(caption, cap_cos, cap_sin)
-        for layer in self.noise_refiner:
-            x = layer(x, img_cos, img_sin, temb)
+
+        if ref is not None:
+            rlen = ref[0] * ref[1]
+            ref_cos, ref_sin = img_cos[:, :rlen], img_sin[:, :rlen]
+            noise_cos, noise_sin = img_cos[:, rlen:], img_sin[:, rlen:]
+            ref_tok = self.ref_image_patch_embedder(self._patchify(ref_latent)) + self.image_index_embedding[0]
+            for layer in self.ref_image_refiner:
+                ref_tok = layer(ref_tok, ref_cos, ref_sin, temb)
+            for layer in self.noise_refiner:
+                x = layer(x, noise_cos, noise_sin, temb)
+            img = mx.concatenate([ref_tok, x], axis=1)         # [ref ; noise]
+        else:
+            for layer in self.noise_refiner:
+                x = layer(x, img_cos, img_sin, temb)
+            img = x
 
         instruct = caption
-        img = x
         for layer in self.double_stream_layers:
             img, instruct = layer(img, instruct, full_cos, full_sin, img_cos, img_sin, temb)
 
-        hidden = mx.concatenate([instruct, img], axis=1)       # fuse
+        hidden = mx.concatenate([instruct, img], axis=1)       # fuse [instruct ; img]
         for layer in self.single_stream_layers:
             hidden = layer(hidden, full_cos, full_sin, temb)
 
         hidden = self.norm_out(hidden, temb)
-        img_tokens = hidden[:, L_cap:]                          # [1, L_img, 64]
+        img_tokens = hidden[:, -L_noise:]                      # noise tokens are last
         return self._unpatchify(img_tokens, H, W)

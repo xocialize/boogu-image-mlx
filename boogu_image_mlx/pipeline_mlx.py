@@ -22,6 +22,15 @@ from .utils.weights import (read_safetensors_dir, read_safetensors_np,
 
 SYSTEM_T2I = ("You are a helpful assistant that generates high-quality images based "
               "on user instructions. The instructions are as follows.")
+SYSTEM_TI2I = ("Describe the key features of the input image (color, shape, size, texture, objects, "
+               "background), then explain how the user's text instruction should alter or modify the "
+               "image. Generate a new image that meets the user's requirements while maintaining "
+               "consistency with the original input where appropriate.")
+
+
+class _Identity:
+    def __call__(self, x):
+        return x
 
 
 class BooguImagePipeline:
@@ -64,7 +73,18 @@ class BooguImagePipeline:
 
         from mlx_vlm import load as vlm_load
         qwen_model, processor = vlm_load(os.path.expanduser(qwen_dir))
-        return cls(dit, vae, scheduler, qwen_model, processor, vcfg)
+        pipe = cls(dit, vae, scheduler, qwen_model, processor, vcfg)
+        # HF processor for image preprocessing (PIL -> pixel_values); proven path.
+        pipe._proc_dir = os.path.join(base_dir, "processor")
+        pipe._hf_processor = None
+        return pipe
+
+    @property
+    def hf_processor(self):
+        if self._hf_processor is None:
+            from transformers import AutoProcessor
+            self._hf_processor = AutoProcessor.from_pretrained(self._proc_dir)
+        return self._hf_processor
 
     def encode_prompt(self, text: str) -> mx.array:
         messages = [
@@ -79,6 +99,55 @@ class BooguImagePipeline:
         base = lm.model if hasattr(lm, "model") else lm
         feats = base(ids)                                  # [1, L, 4096] last_hidden_state
         return feats.astype(self.dit.x_embedder.weight.dtype)
+
+    def encode_prompt_with_image(self, image, text: str) -> mx.array:
+        """TI2I conditioning: Qwen3-VL last_hidden_state over [image, text]."""
+        messages = [
+            {"role": "system", "content": [{"type": "text", "text": SYSTEM_TI2I}]},
+            {"role": "user", "content": [{"type": "image", "image": image},
+                                         {"type": "text", "text": text}]},
+        ]
+        enc = self.hf_processor.apply_chat_template(
+            [messages], tokenize=True, return_dict=True,
+            add_generation_prompt=False, padding=True, return_tensors="np")
+        orig = self.qwen.language_model.lm_head
+        self.qwen.language_model.lm_head = _Identity()
+        h = self.qwen(mx.array(np.asarray(enc["input_ids"])),
+                      pixel_values=mx.array(np.asarray(enc["pixel_values"])),
+                      image_grid_thw=mx.array(np.asarray(enc["image_grid_thw"])), mask=None)
+        self.qwen.language_model.lm_head = orig
+        h = h.logits if hasattr(h, "logits") else h
+        return h.astype(self.dit.x_embedder.weight.dtype)
+
+    def vae_encode(self, image, height: int, width: int) -> mx.array:
+        """Encode an input image to a scaled ref latent (= (mean - shift) * scale)."""
+        img = image.convert("RGB").resize((width, height))
+        arr = np.asarray(img).astype(np.float32) / 255.0 * 2 - 1     # [H,W,3] in [-1,1]
+        x = mx.array(arr.transpose(2, 0, 1)[None])                   # [1,3,H,W]
+        moments = self.vae.encode_moments(x)                         # [1,32,H/8,W/8]
+        mean = moments[:, :16]
+        ref = (mean - self.vae_cfg["shift_factor"]) * self.vae_cfg["scaling_factor"]
+        return ref.astype(self.dit.x_embedder.weight.dtype)
+
+    def generate_edit(self, image, instruction: str, height: int = 768, width: int = 768,
+                      steps: int = 50, text_guidance: float = 4.0, seed: int = 0) -> np.ndarray:
+        pos = self.encode_prompt_with_image(image, instruction)
+        neg = self.encode_prompt_with_image(image, "")
+        ref = self.vae_encode(image, height, width)
+        hl, wl = height // 8, width // 8
+        self.scheduler.set_timesteps(steps, num_tokens=hl * wl)
+        mx.random.seed(seed)
+        lat = mx.random.normal((1, 16, hl, wl)).astype(pos.dtype)
+        for i in range(steps):
+            t = mx.array([float(self.scheduler.timesteps[i])], dtype=pos.dtype)
+            pc = self.dit(lat, t, pos, ref_latent=ref)
+            pu = self.dit(lat, t, neg, ref_latent=ref)
+            lat = self.scheduler.step(pu + text_guidance * (pc - pu), i, lat)
+            mx.eval(lat); mx.clear_cache()
+        z = lat.astype(mx.float32) / self.vae_cfg["scaling_factor"] + self.vae_cfg["shift_factor"]
+        img = self.vae.decode(z); mx.eval(img)
+        arr = np.clip(np.array(img)[0] / 2 + 0.5, 0, 1)
+        return (arr.transpose(1, 2, 0) * 255).astype(np.uint8)
 
     def generate(self, prompt: str, negative: str = "", height: int = 1024,
                  width: int = 1024, steps: int = 30, guidance: float = 3.5,
